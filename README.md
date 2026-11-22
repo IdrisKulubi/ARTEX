@@ -57,8 +57,9 @@ printed at startup:
 docker compose logs artex | grep "Setup token"
 ```
 
-> There is no prebuilt Docker image to pull: the image is always built from your checkout.
-> For all installation paths (script, binaries, source, release archives), see [Installation](#installation).
+> Multi-arch release images (`linux/amd64`, `linux/arm64`) are published to GitHub Container
+> Registry at `ghcr.io/baarai/artex`. For pulling the prebuilt image and all other installation
+> paths (script, binaries, source, release archives), see [Installation](#installation).
 
 ---
 
@@ -331,7 +332,9 @@ The UI listens on `127.0.0.1` by default. To reach it from another machine (or f
 ARTEX runs inside WSL), set `ARTEX_BIND_ADDR=0.0.0.0` in `.env` (the setup token still protects the
 first-run claim), or keep loopback and use a reverse proxy or SSH tunnel.
 
-### Option 2: Docker Compose (manual)
+### Option 2: Docker (Compose checkout build or prebuilt GHCR image)
+
+Build from a checkout with Docker Compose:
 
 ```bash
 git clone https://github.com/BaaRai/ARTEX.git
@@ -341,8 +344,73 @@ docker compose up -d --build
 # → http://localhost:8787
 ```
 
+Each `v*` release publishes a multi-arch image (`linux/amd64`, `linux/arm64`) to GitHub
+Container Registry with tags `:latest`, `:v<version>`, and `:<version>`. GHCR packages start
+private. After the first release, maintainers should check that the `artex` package visibility
+is set to Public and verify the pull below on a machine without GHCR credentials before
+announcing anonymous installation.
+
+The standalone container requires an existing PostgreSQL database reachable from the container.
+Set the `ARTEX_PG_*` variables below. The example uses Docker Desktop's
+`host.docker.internal` to reach PostgreSQL on the host. On native Linux Docker Engine, add
+`--add-host=host.docker.internal:host-gateway` to `docker run` for a host database, or use
+the reachable hostname of your database server.
+
+```bash
+docker pull ghcr.io/baarai/artex:latest
+
+mkdir -p data keys
+docker run -d --name artex \
+  --security-opt no-new-privileges:true \
+  -p 127.0.0.1:8787:8787 \
+  -p 127.0.0.1:8788:8788 \
+  -e ARTEX_PG_HOST=host.docker.internal \
+  -e ARTEX_PG_PORT=5432 \
+  -e ARTEX_PG_USER=artex \
+  -e ARTEX_PG_PASSWORD='yourpass' \
+  -e ARTEX_PG_DBNAME=artex \
+  -e ARTEX_PG_SSLMODE=disable \
+  -e ARTEX_JWT_KEY_DIR=/app/keys \
+  -v "$PWD/data:/app/data" \
+  -v "$PWD/keys:/app/keys" \
+  ghcr.io/baarai/artex:latest
+# → http://localhost:8787  (docker logs artex | grep "Setup token")
+```
+
+In `docker-compose.yml` and `docker-compose.ghcr.yml`, `POSTGRES_PASSWORD` is passed to ARTEX as
+its own variable. The server percent-encodes it into the connection URL, so a password may contain
+`/`, `?`, `%`, `@`, `:` or spaces. In `.env`, quote a value that contains `#`, and write `$$` for a
+literal `$`. The `ARTEX_PG_*` variables take the password raw; quote it in a shell.
+
 The image includes a scanner toolchain (`nmap`, `nuclei`, `httpx`, `katana`, `ffuf`, `dalfox`,
-`sqlmap`, `ripgrep`, `curl`, `npm`, …); `./skills` and `./data` are persisted via bind mounts.
+`sqlmap`, `ripgrep`, `curl`, `npm`, …) and built-in `/app/skills`. The GHCR Compose file below
+persists `./keys` and `./data`; it does not mount a host `skills/` directory, so the image's
+built-in skills are used.
+
+#### Compose stack from the prebuilt image
+
+`docker-compose.ghcr.yml` runs the same ARTEX + PostgreSQL stack from the released image, with no
+checkout build. Download it and `.env.example` once:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/BaaRai/ARTEX/main/docker-compose.ghcr.yml
+curl -fsSLO https://raw.githubusercontent.com/BaaRai/ARTEX/main/.env.example
+cp .env.example .env            # set POSTGRES_PASSWORD, optionally an LLM key
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
+# → http://localhost:8787  (docker compose -f docker-compose.ghcr.yml logs artex | grep "Setup token")
+```
+
+Update the stack without a git checkout:
+
+```bash
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
+```
+
+Pin a version with `ARTEX_IMAGE_TAG=v0.7.1` in `.env` (or `0.7.1`); unset uses `latest`. To use
+custom skills, copy them into a host directory and add `- ./skills:/app/skills` to the `artex`
+volumes, which overrides the built-in `/app/skills`.
 
 For remote MCP you can choose `http` (Streamable HTTP) or `sse` (legacy SSE) in system settings.
 Legacy SSE servers usually establish the event stream with `GET /sse` and receive JSON-RPC over
@@ -427,6 +495,20 @@ runtime supports it.
 `https://api.anthropic.com`); ARTEX appends `/v1/messages`. OpenAI-format providers append
 `/chat/completions` (or `/responses` for `openai-responses`), so their base **does** end in `/v1`
 (for example `https://api.openai.com/v1`).
+
+**OpenAI-compatible gateways**: any provider that serves an OpenAI-style
+`/v1/chat/completions` endpoint works through the **OpenAI** format — no dedicated format
+needed. Create a profile with format **OpenAI**, set **Base URL** to the gateway's `/v1`
+root, paste the key, then click the **↻** button next to *Model* to load the provider's
+catalog (`GET /v1/models`) and pick a model; models the provider adds later appear on the
+next refresh. For example, [NotHoly](https://notholy.com) (offensive-security models) uses
+base URL `https://api.notholy.com/v1` with an API key from its console.
+
+**Task archive storage**: local disk by default. Set `ARTEX_ARCHIVE_STORAGE=s3` to
+store cold task packages in an S3-compatible bucket and release their local
+package space after verification. Existing local archives remain usable. See
+[Task archive storage](docs/task-archive-storage.md) for configuration, permissions,
+integrity checks, temporary disk requirements and recovery.
 
 **Concurrency**: work agents per task, in "System Settings" (default 3).
 
@@ -537,6 +619,25 @@ a trusted peer can claim any client address.
 
 ## Operations
 
+### Troubleshooting an empty tool call
+
+In the task's session transcript, expand the affected tool call and compare **Command** and
+**Output**. The `UNTRUSTED_OUTPUT` markers identify the boundary around tool output. They are
+expected and should stay enabled while troubleshooting.
+
+- **Command shows `{}`.** The recorded tool input is an empty JSON object. For a tool that
+  requires a command, this means its command argument was missing. Check which model and version
+  produced the call.
+- **Command shows `(empty)` or `(failed to load)`.** The transcript has no input detail to display
+  or could not fetch it. If the session record contains a command, include that discrepancy in a
+  report.
+- **Output shows `[]`.** This is the recorded result body. Check the row's success or failure
+  indicator and its input separately before drawing conclusions about what ran.
+
+For a recurring problem, share the ARTEX version or commit, the model and version, and a sanitized
+excerpt of the affected input and result. Remove credentials, target data, and other sensitive
+content before sharing.
+
 ### Backups
 
 `scripts/backup.sh` dumps the Postgres database (and optionally the data directory) with
@@ -610,7 +711,7 @@ The script optionally `git pull`s, then offers **① Docker update** (`docker co
 `docker compose up -d artex`) or **② local build update** (rebuild the frontend static assets, then
 recompile `./artex`; restart the process for it to take effect).
 
-#### Option 2: Docker Compose (manual)
+#### Option 2: Docker (Compose or GHCR image)
 
 ```bash
 cd ARTEX
@@ -618,6 +719,15 @@ git pull
 docker compose build artex
 docker compose up -d artex
 docker image prune -f            # optional
+```
+
+If running the prebuilt `ghcr.io/baarai/artex` container directly, pull the new tag (`docker pull
+ghcr.io/baarai/artex:latest` or a pinned `:v<version>`) and recreate the container with the same
+`/app/data` and `/app/keys` mounts. If you run the prebuilt Compose stack, the update is:
+
+```bash
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
 ```
 
 #### Option 3: prebuilt binaries
@@ -651,6 +761,7 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 - Backend: `go run ./cmd/artex` (without `-tags embedui`, the frontend is not embedded)
 - Frontend: `cd web && npm run dev` (`/api` is reverse-proxied to the backend, with hot reload)
 - Tests: `go test ./...`
+- Reproduce all CI checks locally: `./scripts/verify.sh` (add `--full` for `-race` and the static web build)
 - Mock preview (no backend): `cd web && NEXT_PUBLIC_MOCK=1 npm run dev`
 
 ---
@@ -717,6 +828,10 @@ flowchart TB
 | **agent** | goals / planner / worker / mainagent; `ToolSet` exposes the dual graphs as LLM tools |
 | **db** | PostgreSQL persistence (pgx); embedded schema and numbered migrations applied at startup |
 | **Supporting** | Recording MITM proxy, approval gate, async enrichment, MCP/skills/memory/report |
+
+For the code-level map (execution flow, trust boundaries, decisions) see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); for startup, configuration precedence,
+backup and key rotation see [docs/OPS.md](docs/OPS.md).
 
 ---
 
