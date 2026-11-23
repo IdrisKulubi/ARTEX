@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,7 +55,8 @@ type Server struct {
 
 	scrubSecrets bool // drop ARTEX_PG_DSN and the API keys from the environment once read (binary only)
 
-	execPriv ExecPrivilege // identity agent processes run under; zero keeps the server's own
+	execPriv  ExecPrivilege   // identity agent processes run under; zero keeps the server's own
+	isolation IsolationStatus // result of the startup isolation self-test (isolation.go); zero when not run
 
 	setupMu    sync.Mutex
 	setupToken string // one-time token POST /api/auth/init requires; empty when none is active
@@ -430,6 +432,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
+	cfg.CustomHeaders = p.CustomHeaders
 	s.applyProfileRetry(&cfg, p)
 	// Ollama profiles run keyless (local server); the other formats need a key.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
@@ -458,9 +461,15 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	var sessionHeaderKey string
 	var userAgent string
 	var retry db.RetryOverride
+	clearCustomHeaders := format != "bedrock-gateway"
 	if profs, _ := s.m.pg.ListProfiles(); profs != nil {
 		for _, p := range profs {
 			if p.Name == "default" {
+				// A header saved for one gateway must not follow the legacy
+				// endpoint's default profile to another destination.
+				if !sameLLMEndpoint(format, cfg.BaseURL, p.Format, p.BaseURL) {
+					clearCustomHeaders = true
+				}
 				id, priority, poolExclude, streaming = p.ID, p.Priority, p.PoolExclude, p.Streaming
 				maxTokens, maxTokensField = p.MaxTokens, p.MaxTokensField
 				sessionHeaderKey = p.SessionHeaderKey
@@ -476,7 +485,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
 		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey, UserAgent: userAgent,
-		Retry: retry,
+		Retry: retry, CustomHeaders: cfg.CustomHeaders, ClearCustomHeaders: clearCustomHeaders,
 	})
 	if err != nil {
 		return err
@@ -609,6 +618,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
+	cfg.CustomHeaders = p.CustomHeaders
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		return cfg, false
@@ -1081,13 +1091,11 @@ func (s *Server) Handler() http.Handler {
 	root.Handle("/api/", api)
 	webui := s.webuiHandler()
 	root.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Keep the operator console out of cross-origin frames and referrers.
-		w.Header().Set("Content-Security-Policy", "frame-ancestors 'self'")
-		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
-		w.Header().Set("Referrer-Policy", "same-origin")
+		// Document-only headers; the shared ones come from securityHeaders.
+		consoleHeaders(w.Header())
 		webui.ServeHTTP(w, r)
 	})
-	return limitRequestBody(root)
+	return s.securityHeaders(limitRequestBody(root))
 }
 
 // --- handlers ---
@@ -1101,6 +1109,10 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]any{"ok": true, "service": "artex", "version": BuildVersion}
+	// The web UI shows a banner on every page for a degraded isolation (isolation.go).
+	if s.isolation.Mode != "" {
+		out["isolation"] = s.isolation
+	}
 	// Opt-in only (ARTEX_UPDATE_CHECK); off, this returns "" without any request.
 	if latest := updates.newerVersion(r.Context(), time.Now(), BuildVersion); latest != "" {
 		out["latest_version"] = latest
@@ -1204,8 +1216,15 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[tasks] list metrics query failed — metrics zeroed: %v", err)
 	}
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
+	// company keeps the tasks scoped to that company (the sidebar switcher). A
+	// non-numeric id, or one no task is scoped to, returns an empty list.
+	companyParam := strings.TrimSpace(r.URL.Query().Get("company"))
+	companyID, companyErr := strconv.ParseInt(companyParam, 10, 64)
 	dtos := make([]TaskDTO, 0, len(list))
 	for _, t := range list {
+		if companyParam != "" && (companyErr != nil || !slices.Contains(t.lifecycleSnapshot().CompanyIDs, companyID)) {
+			continue
+		}
 		dto := taskDTO(t, s.resolvedTaskStatus(t))
 		applyTaskArchiveBlocker(&dto, archiveBlockers)
 		s.applyTaskMetrics(&dto, t, metrics[t.ExpID])
@@ -1487,6 +1506,7 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		ContextWindowK  int     `json:"context_window_k"`
 		ThinkingType    string  `json:"thinking_type"`
 		ReasoningEffort string  `json:"reasoning_effort"`
+		CustomHeaders   string  `json:"custom_headers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1501,18 +1521,26 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 	cfg.RatePerSecond, cfg.RatePerMinute = req.RatePerSecond, req.RatePerMinute
 	cfg.ThinkingType = req.ThinkingType
 	cfg.ReasoningEffort = req.ReasoningEffort
+	cfg.CustomHeaders = req.CustomHeaders
 	if k := req.ContextWindowK; k > 0 { // 0 = keep default (200K); cap at 1M
 		if k > 1000 {
 			k = 1000
 		}
 		cfg.ContextWindowK = k
 	}
-	// Keyless formats (Ollama) need no key; the others keep/require one.
-	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
-		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey // keep existing key if not re-entered
-		s.cfgMu.Unlock()
+	// A rotated token at the same gateway still uses that gateway's saved
+	// headers. Neither secret follows a changed endpoint.
+	s.cfgMu.Lock()
+	if sameLLMEndpoint(req.Provider, req.BaseURL, s.llmCfg.Provider(), s.llmCfg.BaseURL) {
+		if cfg.APIKey == "" && cfg.NeedsAPIKey() {
+			cfg.APIKey = s.llmCfg.APIKey
+		}
+		if cfg.CustomHeaders == "" && cfg.Format == agent.FormatBedrockGateway {
+			cfg.CustomHeaders = s.llmCfg.CustomHeaders
+		}
 	}
+	s.cfgMu.Unlock()
+	// Keyless formats (Ollama) need no key; the others keep/require one.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		writeErr(w, 400, "api_key required")
 		return
@@ -1553,6 +1581,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		Streaming        *bool  `json:"streaming"`          // omitted = streaming, the same defaults as when saving a profile
 		SessionHeaderKey string `json:"session_header_key"` // non-empty = the test also sends this custom session header, with a one-off random session id as the value
 		UserAgent        string `json:"user_agent"`         // non-empty = the test overrides the User-Agent header with this value (mirrors production)
+		CustomHeaders    string `json:"custom_headers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1634,6 +1663,14 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg.UserAgent = ua
+	cfg.CustomHeaders = req.CustomHeaders
+	if stored != nil && cfg.CustomHeaders == "" && sameLLMEndpoint(req.Provider, req.BaseURL, stored.Format, stored.BaseURL) {
+		cfg.CustomHeaders = stored.CustomHeaders
+	}
+	if _, err := agent.ParseBedrockGatewayHeaders(cfg.CustomHeaders); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	// Keyless formats (Ollama) skip the key resolution entirely.
 	if cfg.NeedsAPIKey() {
 		// API key resolution precedence: form input > the named profile's stored key > the global config's key.
@@ -1659,6 +1696,9 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 			if global.APIKey != "" {
 				if sameLLMEndpoint(req.Provider, req.BaseURL, global.Provider(), global.BaseURL) {
 					cfg.APIKey = global.APIKey
+					if cfg.CustomHeaders == "" {
+						cfg.CustomHeaders = global.CustomHeaders
+					}
 				} else {
 					withheld = true
 				}
@@ -2232,9 +2272,10 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 	taskParam := q.Get("task")
 	if taskParam == "" {
 		// With page/limit → server-side pagination {items,total,...}; without → a bare array (for dashboard aggregation,
-		// same compat policy as the intents endpoint). Filtering/sorting is pushed down to SQL uniformly.
+		// same compat policy as the intents endpoint). Filtering/sorting is pushed down to SQL uniformly, and the bare
+		// array honours the filters too: the dashboard narrows by the active company through asset_scope.
 		if q.Get("page") == "" && q.Get("limit") == "" {
-			fs, _ := s.m.pg.ListFindings(500)
+			fs, _ := s.m.pg.ListFindingsFiltered(findingFilterFromQuery(q), 500)
 			assets := s.resolveFindingAssets(fs)
 			out := make([]FindingDTO, 0, len(fs))
 			for _, f := range fs {
@@ -2362,7 +2403,8 @@ func (s *Server) resolveAssetIDs(ids []int64) map[int64]*db.Asset {
 // findingStats serves the whole-table aggregates (stat cards + vuln-class filter)
 // for the paginated Findings page.
 func (s *Server) findingStats(w http.ResponseWriter, r *http.Request) {
-	st, err := s.m.pg.FindingStats()
+	// company narrows the cards to the sidebar's company, with the list's rule.
+	st, err := s.m.pg.FindingStatsForCompany(r.URL.Query().Get("company"))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -3559,7 +3601,17 @@ func (s *Server) getTraffic(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	page := atoiDefault(q.Get("page"), 0)
 	size := atoiDefault(q.Get("size"), 100)
-	ex, matched, _ := tr.Page(parseTrafficPageQuery(q), page, size)
+	// company narrows the list to the hosts that company owns, so the page
+	// follows the sidebar switcher like every other asset-backed view.
+	hosts, err := s.companyHosts(int64(atoiDefault(q.Get("company"), 0)))
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	pq := parseTrafficPageQuery(q)
+	pq.Hosts = hosts
+	pq.MatchNone = q.Get("company") != "" && len(hosts) == 0 // a company owning no host matches nothing
+	ex, matched, _ := tr.Page(pq, page, size)
 	count, _ := tr.Count() // global total, for the stat card
 	writeJSON(w, 200, map[string]any{
 		"enabled":   s.m.TrafficEnabled(), // reflect the capture toggle
@@ -3697,6 +3749,7 @@ func (s *Server) getTrafficExchange(w http.ResponseWriter, r *http.Request) {
 // getTrafficStream returns one page of a WebSocket/SSE exchange's messages in
 // order (limit 1..200, default 50). direction=c2s or s2c keeps one side of the
 // conversation (plus the meta limit marker); any other non-empty value is a 400.
+// total counts rows for pagination; message_total excludes meta limit markers.
 func (s *Server) getTrafficStream(w http.ResponseWriter, r *http.Request) {
 	tr := s.m.Traffic()
 	if tr == nil {
@@ -3712,7 +3765,7 @@ func (s *Server) getTrafficStream(w http.ResponseWriter, r *http.Request) {
 	offset, _ := strconv.Atoi(q.Get("offset"))
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	direction := strings.ToLower(strings.TrimSpace(q.Get("direction")))
-	msgs, total, err := tr.StreamMessagesByDirection(id, direction, offset, limit)
+	page, err := tr.StreamMessagePageByDirection(id, direction, offset, limit)
 	if errors.Is(err, traffic.ErrBadStreamDirection) {
 		writeErr(w, 400, err.Error())
 		return
@@ -3721,7 +3774,7 @@ func (s *Server) getTrafficStream(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"items": msgs, "total": total})
+	writeJSON(w, 200, page)
 }
 
 // maxReplayRequestBytes bounds the replay request body (JSON, with the payload
